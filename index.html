@@ -1,0 +1,419 @@
+<script type="module">
+// ============================================
+// FIREBASE IMPORTS
+// ============================================
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js";
+import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, onAuthStateChanged, signOut, GoogleAuthProvider, signInWithPopup } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js";
+import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/10.14.1/firebase-database.js";
+
+const firebaseConfig = {
+    apiKey: "AIzaSyC34wX5Y1J04rqFk7qoqa56YtpAGId7D_8",
+    authDomain: "nls-logistique.firebaseapp.com",
+    databaseURL: "https://nls-logistique-default-rtdb.firebaseio.com",
+    projectId: "nls-logistique",
+    storageBucket: "nls-logistique.firebasestorage.app",
+    messagingSenderId: "335471244164",
+    appId: "1:335471244164:web:f40fa3ac291c842ad423d1",
+    measurementId: "G-KKPF1DTMYP"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getDatabase(app);
+
+let models = []; let stock = []; let orders = []; let dailySheets = {}; let salesHistory = []; let currentUser = null; let isRegisterMode = false;
+
+// EXPOSER LES FONCTIONS GLOBALEMENT
+window.toggleAuthMode = function() {
+    isRegisterMode = !isRegisterMode;
+    const btn = document.getElementById('authSubmitBtn');
+    const toggleText = document.getElementById('authToggleText');
+    const nameGroup = document.getElementById('authNameGroup');
+    document.getElementById('authError').classList.add('hidden');
+    if (isRegisterMode) {
+        btn.textContent = "S'inscrire";
+        toggleText.innerHTML = "Déjà un compte ? <a onclick=\"window.toggleAuthMode()\">Se connecter</a>";
+        nameGroup.classList.remove('hidden');
+    } else {
+        btn.textContent = 'Se connecter';
+        toggleText.innerHTML = "Pas encore de compte ? <a onclick=\"window.toggleAuthMode()\">S'inscrire</a>";
+        nameGroup.classList.add('hidden');
+    }
+};
+
+// CONNEXION AVEC GOOGLE OPTIMISÉE (POPUP)
+document.getElementById('googleSignInBtn').addEventListener('click', async () => {
+    const provider = new GoogleAuthProvider();
+    const errorDiv = document.getElementById('authError');
+    errorDiv.classList.add('hidden');
+    
+    try {
+        const result = await signInWithPopup(auth, provider);
+        if (result.user) {
+            showToast('Connexion Google réussie !');
+        }
+    } catch (error) {
+        console.error("Erreur Google Auth:", error);
+        errorDiv.textContent = "Erreur Google : " + error.message;
+        errorDiv.classList.remove('hidden');
+    }
+});
+
+document.getElementById('authSubmitBtn').addEventListener('click', async () => {
+    const email = document.getElementById('authEmail').value.trim();
+    const password = document.getElementById('authPassword').value;
+    const errorDiv = document.getElementById('authError');
+    errorDiv.classList.add('hidden');
+    if (!email || !password) { errorDiv.textContent = 'Remplissez tous les champs'; errorDiv.classList.remove('hidden'); return; }
+    try {
+        if (isRegisterMode) { await createUserWithEmailAndPassword(auth, email, password); showToast('Compte créé !'); }
+        else { await signInWithEmailAndPassword(auth, email, password); showToast('Connecté !'); }
+    } catch (e) { errorDiv.textContent = e.message; errorDiv.classList.remove('hidden'); }
+});
+
+document.getElementById('logoutBtn').addEventListener('click', () => { signOut(auth); });
+
+onAuthStateChanged(auth, (user) => {
+    if (user) {
+        currentUser = user;
+        document.getElementById('authScreen').classList.add('hidden');
+        document.getElementById('mainApp').classList.remove('hidden');
+        document.getElementById('userEmail').textContent = user.email || 'Utilisateur';
+        loadAllData();
+    } else {
+        currentUser = null;
+        document.getElementById('authScreen').classList.remove('hidden');
+        document.getElementById('mainApp').classList.add('hidden');
+    }
+});
+
+function loadAllData() {
+    onValue(ref(db, 'models'), (snapshot) => { models = snapshot.val() || []; renderModelsList(); updateSearchDropdowns(); updateReturnDropdowns(); });
+    onValue(ref(db, 'stock'), (snapshot) => { stock = snapshot.val() || []; renderStockDetailTable(); updateSearchDropdowns(); updateReturnDropdowns(); });
+    onValue(ref(db, 'orders'), (snapshot) => { orders = snapshot.val() || []; renderPendingOrders(); renderShippedTable(); calculateDailySheet(); });
+    onValue(ref(db, 'dailySheets'), (snapshot) => { dailySheets = snapshot.val() || {}; renderDailyHistory(); calculateDailySheet(); });
+    onValue(ref(db, 'salesHistory'), (snapshot) => { salesHistory = snapshot.val() || []; calculateDailySheet(); });
+}
+
+async function saveToFirebase() {
+    await set(ref(db, 'models'), models);
+    await set(ref(db, 'stock'), stock);
+    await set(ref(db, 'orders'), orders);
+    await set(ref(db, 'dailySheets'), dailySheets);
+    await set(ref(db, 'salesHistory'), salesHistory);
+}
+
+function showToast(m, type = 'success') {
+    const c = document.getElementById('toastContainer');
+    if (!c) return;
+    const t = document.createElement('div'); t.className = `toast toast-${type}`;
+    t.innerHTML = `<span>${type==='success'?'✅':'❌'}</span> ${m}`; c.appendChild(t);
+    setTimeout(() => { t.remove(); }, 3000);
+}
+
+function formatCurrency(v) { return new Intl.NumberFormat('fr-FR').format(v || 0); }
+function getTodayString() { return new Date().toISOString().split('T')[0]; }
+
+// ONGLONS NAV
+function switchTab(id) {
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.getElementById(id).classList.add('active');
+    document.getElementById(id+'Btn').classList.add('active');
+    if(id === 'tab3') { setToday(); }
+}
+document.getElementById('tab1Btn').addEventListener('click', () => switchTab('tab1'));
+document.getElementById('tab2Btn').addEventListener('click', () => switchTab('tab2'));
+document.getElementById('tab3Btn').addEventListener('click', () => switchTab('tab3'));
+
+// ASSISTANCE ÉTAPES FORMULAIRE STOCK
+window.goToStep = function(step) {
+    if(step === 2 && (!document.getElementById('modelName').value || !document.getElementById('modelCostPrice').value || !document.getElementById('modelSellPrice').value)) {
+        alert('Veuillez remplir tous les champs requis de l\'etape 1.');
+        return;
+    }
+    document.querySelectorAll('.step-section').forEach(s => s.classList.add('hidden'));
+    document.getElementById('step'+step).classList.remove('hidden');
+    document.querySelectorAll('.step-dot').forEach((d, i) => { d.classList.remove('active'); if(i+1===step) d.classList.add('active'); });
+    if(step === 4) {
+        const name = document.getElementById('modelName').value;
+        const cCount = parseInt(document.getElementById('colorCount').value) || 0;
+        const sCount = parseInt(document.getElementById('sizeCount').value) || 0;
+        const units = parseInt(document.getElementById('unitsPerVariant').value) || 0;
+        
+        const colorsArr = Array.from(document.querySelectorAll('.color-input')).map(i => i.value.trim()).filter(v => v !== "");
+        const sizesArr = Array.from(document.querySelectorAll('.size-input')).map(i => i.value.trim()).filter(v => v !== "");
+
+        document.getElementById('summaryModel').textContent = name;
+        document.getElementById('summaryColors').textContent = colorsArr.join(', ') || '-';
+        document.getElementById('summarySizes').textContent = sizesArr.join(', ') || '-';
+        document.getElementById('summaryUnits').textContent = units;
+        document.getElementById('summaryTotal').textContent = (colorsArr.length * sizesArr.length * units) + " paires";
+    }
+};
+document.getElementById('toStep2Btn').addEventListener('click', () => window.goToStep(2));
+document.getElementById('backToStep1Btn').addEventListener('click', () => window.goToStep(1));
+document.getElementById('toStep3Btn').addEventListener('click', () => window.goToStep(3));
+document.getElementById('backToStep2Btn').addEventListener('click', () => window.goToStep(2));
+document.getElementById('toStep4Btn').addEventListener('click', () => window.goToStep(4));
+document.getElementById('backToStep3Btn').addEventListener('click', () => window.goToStep(3));
+
+document.getElementById('colorCount').addEventListener('input', () => {
+    const c = document.getElementById('colorInputsContainer'); c.innerHTML = '';
+    const val = parseInt(document.getElementById('colorCount').value) || 0;
+    for(let i=0; i<val; i++) {
+        c.innerHTML += `<div class="dynamic-input-item"><span class="index-badge">${i+1}</span><input type="text" class="color-input" placeholder="Couleur"/></div>`;
+    }
+});
+document.getElementById('sizeCount').addEventListener('input', () => {
+    const c = document.getElementById('sizeInputsContainer'); c.innerHTML = '';
+    const val = parseInt(document.getElementById('sizeCount').value) || 0;
+    for(let i=0; i<val; i++) {
+        c.innerHTML += `<div class="dynamic-input-item"><span class="index-badge">${i+1}</span><input type="text" class="size-input" placeholder="Pointure"/></div>`;
+    }
+});
+
+document.getElementById('validateModelBtn').addEventListener('click', async () => {
+    const name = document.getElementById('modelName').value.trim();
+    const cost = parseFloat(document.getElementById('modelCostPrice').value) || 0;
+    const sell = parseFloat(document.getElementById('modelSellPrice').value) || 0;
+    const delivery = parseFloat(document.getElementById('modelDeliveryFee').value) || 0;
+    const mId = 'model_' + Date.now();
+    const colors = Array.from(document.querySelectorAll('.color-input')).map(i => i.value.trim()).filter(v => v !== "");
+    const sizes = Array.from(document.querySelectorAll('.size-input')).map(i => i.value.trim()).filter(v => v !== "");
+    const qty = parseInt(document.getElementById('unitsPerVariant').value) || 0;
+    
+    if(!name || colors.length === 0 || sizes.length === 0 || qty === 0) {
+        alert("Données incomplètes.");
+        return;
+    }
+
+    models.push({ id: mId, name, costPrice: cost, sellPrice: sell, colors, sizes });
+    colors.forEach(c => { sizes.forEach(s => {
+        stock.push({ id: 'st_'+Date.now()+'_'+Math.floor(Math.random()*10000), modelId: mId, modelName: name, color: c, size: s, quantity: qty, costPrice: cost, sellPrice: sell, deliveryFee: delivery });
+    });});
+    
+    await saveToFirebase(); 
+    showToast('Stock cree !'); 
+    
+    // Reset Form
+    document.getElementById('modelName').value = '';
+    document.getElementById('modelCostPrice').value = '';
+    document.getElementById('modelSellPrice').value = '';
+    document.getElementById('modelDeliveryFee').value = '0';
+    document.getElementById('colorCount').value = '';
+    document.getElementById('sizeCount').value = '';
+    document.getElementById('unitsPerVariant').value = '';
+    document.getElementById('colorInputsContainer').innerHTML = '';
+    document.getElementById('sizeInputsContainer').innerHTML = '';
+    
+    window.goToStep(1);
+});
+
+function renderModelsList() {
+    const c = document.getElementById('modelsListContainer'); c.innerHTML = '';
+    if(models.length === 0) {
+        c.innerHTML = `<div class="empty-state"><div class="icon">📦</div><h3>Aucun modele enregistre</h3><p>Creez votre premier modele en utilisant le formulaire ci-dessus.</p></div>`;
+        return;
+    }
+    models.forEach(m => { c.innerHTML += `<div class="model-list-item"><div><strong>${m.name}</strong><span> (Couleurs: ${m.colors.length}, Pointures: ${m.sizes.length})</span></div></div>`; });
+}
+function renderStockDetailTable() {
+    const b = document.getElementById('stockDetailBody'); b.innerHTML = '';
+    if(stock.length === 0) {
+        b.innerHTML = `<tr><td colspan="6" style="text-align:center;color:var(--gray);">Aucun stock enregistre</td></tr>`;
+        return;
+    }
+    stock.forEach(s => { b.innerHTML += `<tr><td>${s.modelName}</td><td>${s.color}</td><td>${s.size}</td><td>${s.quantity}</td><td>${formatCurrency(s.costPrice)} DA</td><td>${formatCurrency(s.sellPrice)} DA</td></tr>`; });
+}
+function renderShippedTable() {
+    const b = document.getElementById('shippedBody'); b.innerHTML = '';
+    const shipped = orders.filter(o => o.status === 'shipped');
+    if(shipped.length === 0) {
+        b.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--gray);">Aucune expedition enregistree</td></tr>`;
+        return;
+    }
+    shipped.forEach(o => { b.innerHTML += `<tr><td>${o.date}</td><td>${o.modelName}</td><td>${o.color}</td><td>${o.size}</td><td>${formatCurrency(o.salePrice)}</td><td>${formatCurrency(o.deliveryFee)}</td><td>${formatCurrency(o.salePrice+o.deliveryFee)}</td></tr>`; });
+}
+
+// MANAGEMENT RECHERCHE / VENTE
+function updateSearchDropdowns() {
+    const m = document.getElementById('searchModel');
+    const selected = m.value;
+    m.innerHTML = '<option value="">-- Choisir un modele --</option>';
+    models.forEach(mod => m.innerHTML += `<option value="${mod.id}">${mod.name}</option>`);
+    if(selected) m.value = selected;
+}
+
+document.getElementById('searchModel').addEventListener('change', () => {
+    const mId = document.getElementById('searchModel').value;
+    const col = document.getElementById('searchColor'); col.innerHTML = '<option value="">-- Choisir une couleur --</option>';
+    const s = document.getElementById('searchSize'); s.innerHTML = '<option value="">-- Choisir une pointure --</option>';
+    
+    const addedColors = new Set();
+    const addedSizes = new Set();
+    
+    stock.filter(st => st.modelId === mId).forEach(st => {
+        if(!addedColors.has(st.color)) { addedColors.add(st.color); col.innerHTML += `<option value="${st.color}">${st.color}</option>`; }
+        if(!addedSizes.has(st.size)) { addedSizes.add(st.size); s.innerHTML += `<option value="${st.size}">${st.size}</option>`; }
+    });
+});
+
+document.getElementById('searchProductBtn').addEventListener('click', () => {
+    const mId = document.getElementById('searchModel').value;
+    const color = document.getElementById('searchColor').value;
+    const size = document.getElementById('searchSize').value;
+    const res = document.getElementById('searchResult'); res.classList.remove('hidden');
+    const cont = document.getElementById('searchResultContent');
+    
+    if(!mId || !color || !size) { cont.innerHTML = 'Sélectionnez un modèle, une couleur et une pointure.'; return; }
+    
+    const item = stock.find(st => st.modelId === mId && st.size === size && st.color === color);
+    if(item && item.quantity > 0) {
+        cont.innerHTML = `<h4>Disponible: ${item.quantity} paires</h4><button class="btn btn-success" id="sellBtn" style="margin-top:10px;">Valider Vente</button>`;
+        document.getElementById('sellBtn').addEventListener('click', async () => {
+            item.quantity--; 
+            const orderId = 'or_'+Date.now();
+            orders.push({id: orderId, modelName: item.modelName, color: item.color, size: item.size, salePrice: item.sellPrice, costPrice: item.costPrice, deliveryFee: item.deliveryFee || 0, status:'pending', date:getTodayString()});
+            salesHistory.push({date: getTodayString(), salePrice: item.sellPrice, costPrice: item.costPrice, deliveryFee: item.deliveryFee || 0});
+            await saveToFirebase(); 
+            showToast('Commande mise en attente');
+            cont.innerHTML = `<h4>Disponible: ${item.quantity} paires</h4><button class="btn btn-success" id="sellBtn" style="margin-top:10px;">Valider Vente</button>`;
+        });
+    } else { cont.innerHTML = '<span style="color:var(--danger); font-weight:bold;">Rupture de stock !</span>'; }
+});
+
+function renderPendingOrders() {
+    const c = document.getElementById('pendingOrdersContainer'); c.innerHTML = '';
+    const pending = orders.filter(o => o.status === 'pending');
+    if(pending.length === 0) {
+        c.innerHTML = `<div class="empty-state"><div class="icon">📭</div><h3>Aucun colis en attente</h3><p>Les commandes validees apparaitront ici.</p></div>`;
+        return;
+    }
+    pending.forEach(o => {
+        const div = document.createElement('div');
+        div.className = 'order-item';
+        div.innerHTML = `<div class="order-info"><strong>${o.modelName}</strong> - ${o.color} (${o.size})</div><div class="order-actions"><button class="btn btn-success btn-sm" id="ship_${o.id}">Expedier</button></div>`;
+        c.appendChild(div);
+        document.getElementById(`ship_${o.id}`).addEventListener('click', async () => {
+            o.status = 'shipped'; 
+            await saveToFirebase();
+            showToast('Colis expédié !');
+        });
+    });
+}
+
+// RETOURS MANAGEMENT
+function updateReturnDropdowns() {
+    const m = document.getElementById('returnModel');
+    const selected = m.value;
+    m.innerHTML = '<option value="">-- Modele --</option>';
+    models.forEach(mod => m.innerHTML += `<option value="${mod.id}">${mod.name}</option>`);
+    if(selected) m.value = selected;
+}
+document.getElementById('returnModel').addEventListener('change', () => {
+    const mId = document.getElementById('returnModel').value;
+    const col = document.getElementById('returnColor'); col.innerHTML = '<option value="">-- Couleur --</option>';
+    const s = document.getElementById('returnSize'); s.innerHTML = '<option value="">-- Pointure --</option>';
+    const addedColors = new Set();
+    const addedSizes = new Set();
+    stock.filter(st => st.modelId === mId).forEach(st => {
+        if(!addedColors.has(st.color)) { addedColors.add(st.color); col.innerHTML += `<option value="${st.color}">${st.color}</option>`; }
+        if(!addedSizes.has(st.size)) { addedSizes.add(st.size); s.innerHTML += `<option value="${st.size}">${st.size}</option>`; }
+    });
+});
+document.getElementById('processReturnBtn').addEventListener('click', async () => {
+    const mId = document.getElementById('returnModel').value;
+    const color = document.getElementById('returnColor').value;
+    const size = document.getElementById('returnSize').value;
+    if(!mId || !color || !size) { alert('Veuillez remplir tous les critères de retour.'); return; }
+    const item = stock.find(st => st.modelId === mId && st.size === size && st.color === color);
+    if(item) {
+        item.quantity++;
+        await saveToFirebase();
+        showToast('Produit réintégré au stock avec succès !');
+    } else { alert('Variante introuvable.'); }
+});
+
+// COMPTABILITÉ / FINANCES DASHBOARD
+function setToday() { document.getElementById('dailyDate').value = getTodayString(); loadDailySheet(); }
+document.getElementById('setTodayBtn').addEventListener('click', setToday);
+document.getElementById('dailyDate').addEventListener('change', loadDailySheet);
+
+function loadDailySheet() {
+    const d = document.getElementById('dailyDate').value; if(!d) return;
+    const s = dailySheets[d] || { adBudget:0, exchangeRate:0, unexpectedExpenses:0, extraGains:0, unexpectedMemo:'' };
+    document.getElementById('adBudget').value = s.adBudget;
+    document.getElementById('exchangeRate').value = s.exchangeRate;
+    document.getElementById('unexpectedExpenses').value = s.unexpectedExpenses;
+    document.getElementById('extraGains').value = s.extraGains;
+    document.getElementById('unexpectedMemo').value = s.unexpectedMemo;
+    calculateDailySheet();
+}
+
+document.getElementById('saveDailySheetBtn').addEventListener('click', async () => {
+    const d = document.getElementById('dailyDate').value; if(!d) return;
+    dailySheets[d] = {
+        adBudget: parseFloat(document.getElementById('adBudget').value)||0,
+        exchangeRate: parseFloat(document.getElementById('exchangeRate').value)||0,
+        unexpectedExpenses: parseFloat(document.getElementById('unexpectedExpenses').value)||0,
+        extraGains: parseFloat(document.getElementById('extraGains').value)||0,
+        unexpectedMemo: document.getElementById('unexpectedMemo').value
+    };
+    await saveToFirebase(); showToast('Fiche sauvegardee !');
+});
+
+function calculateDailySheet() {
+    const d = document.getElementById('dailyDate').value; if(!d) return;
+    const currentSheet = dailySheets[d] || { adBudget:0, exchangeRate:0, unexpectedExpenses:0, extraGains:0 };
+    
+    const daySales = salesHistory.filter(sh => sh.date === d);
+    const ca = daySales.reduce((sum, h) => sum + h.salePrice, 0);
+    const cost = daySales.reduce((sum, h) => sum + h.costPrice, 0);
+    
+    const adBudgetInput = parseFloat(document.getElementById('adBudget').value) || currentSheet.adBudget || 0;
+    const exchangeRateInput = parseFloat(document.getElementById('exchangeRate').value) || currentSheet.exchangeRate || 0;
+    const unexp = parseFloat(document.getElementById('unexpectedExpenses').value) || currentSheet.unexpectedExpenses || 0;
+    const extra = parseFloat(document.getElementById('extraGains').value) || currentSheet.extraGains || 0;
+    
+    const adCostDA = adBudgetInput * exchangeRateInput;
+    const totalExp = cost + adCostDA + unexp;
+    const net = ca - totalExp + extra;
+    
+    document.getElementById('statCA').textContent = formatCurrency(ca);
+    document.getElementById('statExpenses').textContent = formatCurrency(totalExp);
+    document.getElementById('statProfit').textContent = formatCurrency(net);
+    document.getElementById('statPairs').textContent = daySales.length;
+
+    // Remplissage du tableau dynamique de résumé de la ligne
+    const summaryBody = document.getElementById('dailySummaryTable');
+    summaryBody.innerHTML = `
+        <tr><td>Ventes Chaussures (CA)</td><td>+ ${formatCurrency(ca)}</td><td>${daySales.length} paires vendues</td></tr>
+        <tr><td>Coût d'achat du stock vendu</td><td>- ${formatCurrency(cost)}</td><td>Prix de revient usine</td></tr>
+        <tr><td>Budget Publicitaire Facebook/TikTok</td><td>- ${formatCurrency(adCostDA)}</td><td>${adBudgetInput}$ au taux de ${exchangeRateInput}</td></tr>
+        <tr><td>Dépenses Imprévues</td><td>- ${formatCurrency(unexp)}</td><td>${document.getElementById('unexpectedMemo').value || 'Aucun détail'}</td></tr>
+        <tr><td>Gains Supplémentaires</td><td>+ ${formatCurrency(extra)}</td><td>Entrées annexes</td></tr>
+    `;
+
+    // Calcul des indicateurs clés
+    const avgSale = daySales.length > 0 ? (ca / daySales.length) : 0;
+    const avgMargin = daySales.length > 0 ? ((ca - cost) / daySales.length) : 0;
+    const marginRate = ca > 0 ? (((ca - cost) / ca) * 100) : 0;
+
+    document.getElementById('avgSalePrice').textContent = formatCurrency(avgSale) + " DA";
+    document.getElementById('avgMargin').textContent = formatCurrency(avgMargin) + " DA";
+    document.getElementById('marginRate').textContent = marginRate.toFixed(1) + "%";
+}
+
+function renderDailyHistory() {
+    const b = document.getElementById('dailyHistoryTable'); b.innerHTML = '';
+    const keys = Object.keys(dailySheets).sort().reverse();
+    if(keys.length === 0) {
+        b.innerHTML = `<tr><td colspan="4" style="text-align:center;color:var(--gray);">Aucune fiche enregistree</td></tr>`;
+        return;
+    }
+    keys.forEach(k => {
+        b.innerHTML += `<tr><td>${k}</td><td>${dailySheets[k].adBudget} $</td><td>${formatCurrency(dailySheets[k].unexpectedExpenses)} DA</td><td><button class="btn btn-secondary btn-sm" onclick="document.getElementById('dailyDate').value='${k}'; document.getElementById('dailyDate').dispatchEvent(new Event('change'));">Ouvrir</button></td></tr>`;
+    });
+}
+</script>
